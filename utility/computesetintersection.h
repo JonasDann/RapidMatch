@@ -59,7 +59,9 @@ public:
                                    ui r_count, ui& cn_count);
     static const ui GallopingSearch(const VertexID *src, ui begin, ui end, ui target);
     static const ui BinarySearch(const VertexID *src, ui begin, ui end, ui target);
-
+#elif SI == 3
+    static void MaxStepIntersect(const VertexID* l, ui l_count, const VertexID* r, ui r_count, VertexID* results, ui &result_count);
+    static void MaxStepIntersect(const VertexID* l, ui l_count, const VertexID* r, ui r_count, ui &result_count);
 #endif
 };
 

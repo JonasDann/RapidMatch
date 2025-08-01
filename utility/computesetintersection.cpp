@@ -35,6 +35,8 @@ void ComputeSetIntersection::ComputeCandidates(const VertexID* larray, const ui 
         merge_cnt_ += 1;
         return ComputeCNNaiveStdMerge(larray, l_count, rarray, r_count, cn, cn_count);
     }
+    #elif SI == 3
+        return MaxStepIntersect(larray, l_count, rarray, r_count, cn, cn_count);
     #endif
 #elif HYBRID == 1
     #if SI == 0
@@ -43,6 +45,8 @@ void ComputeSetIntersection::ComputeCandidates(const VertexID* larray, const ui 
         return ComputeCNMergeBasedAVX512(larray, l_count, rarray, r_count, cn, cn_count);
     #elif SI == 2
         return ComputeCNNaiveStdMerge(larray, l_count, rarray, r_count, cn, cn_count);
+    #elif SI == 3
+        return MaxStepIntersect(larray, l_count, rarray, r_count, cn, cn_count);
     #endif
 #endif
 }
@@ -72,6 +76,8 @@ void ComputeSetIntersection::ComputeCandidates(const VertexID* larray, const ui 
         else {
             return ComputeCNNaiveStdMerge(larray, l_count, rarray, r_count, cn_count);
         }
+    #elif SI == 3
+        return MaxStepIntersect(larray, l_count, rarray, r_count, cn_count);
     #endif
 #elif HYBRID == 1
     #if SI == 0
@@ -80,6 +86,8 @@ void ComputeSetIntersection::ComputeCandidates(const VertexID* larray, const ui 
         return ComputeCNMergeBasedAVX512(larray, l_count, rarray, r_count, cn_count);
     #elif SI == 2
         return ComputeCNNaiveStdMerge(larray, l_count, rarray, r_count, cn_count);
+    #elif SI == 3
+        return MaxStepIntersect(larray, l_count, rarray, r_count, cn_count);
     #endif
 #endif
 }
@@ -1124,4 +1132,261 @@ const ui ComputeSetIntersection::BinarySearch(const VertexID *src, const ui begi
 
     return (ui)offset_end;
 }
+#elif SI == 3
+
+size_t binary_search(VertexID const *array, size_t start, size_t length, VertexID val) {
+    size_t low = start;
+    size_t high = start + 1;
+    while (high < length && array[high] < val) {
+        low = high;
+        high = (2 * high < length) ? 2 * high : length;
+    }
+    while (low < high) {
+        size_t mid = low + (high - low) / 2;
+        if (array[mid] < val) { low = mid + 1; }
+        else { high = mid; }
+    }
+    return low;
+}
+
+void intersect_linear(VertexID const *l, size_t l_count, VertexID const *r, size_t r_count, VertexID *results, ui &result_count) {
+    result_count = 0;
+    size_t i = 0, j = 0;
+    while (i != l_count && j != r_count) {
+        uint32_t li = l[i];
+        uint32_t rj = r[j];
+        results[result_count] = li;
+        result_count += li == rj;
+        i += li  < rj;
+        j += li >= rj;
+    }
+}
+
+void intersect_linear(VertexID const *l, size_t l_count, VertexID const *r, size_t r_count, ui &result_count) {
+    result_count = 0;
+    size_t i = 0, j = 0;
+    while (i != l_count && j != r_count) {
+        uint32_t li = l[i];
+        uint32_t rj = r[j];
+        result_count += li == rj;
+        i += li  < rj;
+        j += li >= rj;
+    }
+}
+
+void intersect_serial(VertexID const *l, size_t l_count, VertexID const *r, size_t r_count, VertexID *results, ui &result_count) {
+    /* Swap arrays if necessary, as we want "longer" to be larger than "shorter" */
+    if (r_count < l_count) {
+        uint32_t const *temp = l;
+        l = r;
+        r = temp;
+        size_t temp_length = l_count;
+        l_count = r_count;
+        r_count = temp_length;
+    }
+
+    /* Use the accurate implementation if galloping is not beneficial */
+    if (r_count < 64 * l_count) {
+        intersect_linear(l, l_count, r, r_count, results, result_count);
+        return;
+    }
+
+    /* Perform galloping, shrinking the target range */
+    result_count = 0;
+    size_t j = 0;
+    for (size_t i = 0; i < l_count; ++i) {
+        uint32_t li = l[i];
+        j = binary_search(r, j, r_count, li);
+        if (j < r_count && r[j] == li) { 
+            results[result_count] = li; 
+            result_count++; 
+        }
+    }
+}
+
+void intersect_serial(VertexID const *l, size_t l_count, VertexID const *r, size_t r_count, ui &result_count) {
+    /* Swap arrays if necessary, as we want "longer" to be larger than "shorter" */
+    if (r_count < l_count) {
+        uint32_t const *temp = l;
+        l = r;
+        r = temp;
+        size_t temp_length = l_count;
+        l_count = r_count;
+        r_count = temp_length;
+    }
+
+    /* Use the accurate implementation if galloping is not beneficial */
+    if (r_count < 64 * l_count) {
+        intersect_linear(l, l_count, r, r_count, result_count);
+        return;
+    }
+
+    /* Perform galloping, shrinking the target range */
+    result_count = 0;
+    size_t j = 0;
+    for (size_t i = 0; i < l_count; ++i) {
+        uint32_t li = l[i];
+        j = binary_search(r, j, r_count, li);
+        if (j < r_count && r[j] == li) {
+            result_count++; 
+        }
+    }
+}
+
+__mmask16 rol(__mmask16 x, int n) { return (x << n) | (x >> (16 - n)); }
+__mmask16 ror(__mmask16 x, int n) { return (x >> n) | (x << (16 - n)); }
+
+__mmask16 simd_intersect(__m512i l, __m512i r) {
+    __m512i l1 = _mm512_alignr_epi32(l, l, 4);
+    __m512i r1 = _mm512_shuffle_epi32(r, _MM_PERM_ADCB);
+    __mmask16 nm00 = _mm512_cmpneq_epi32_mask(l, r);
+
+    __m512i l2 = _mm512_alignr_epi32(l, l, 8);
+    __m512i l3 = _mm512_alignr_epi32(l, l, 12);
+    __mmask16 nm01 = _mm512_cmpneq_epi32_mask(l1, r);
+    __mmask16 nm02 = _mm512_cmpneq_epi32_mask(l2, r);
+
+    __mmask16 nm03 = _mm512_cmpneq_epi32_mask(l3, r);
+    __mmask16 nm10 = _mm512_mask_cmpneq_epi32_mask(nm00, l, r1);
+    __mmask16 nm11 = _mm512_mask_cmpneq_epi32_mask(nm01, l1, r1);
+
+    __m512i r2 = _mm512_shuffle_epi32(r, _MM_PERM_BADC);
+    __mmask16 nm12 = _mm512_mask_cmpneq_epi32_mask(nm02, l2, r1);
+    __mmask16 nm13 = _mm512_mask_cmpneq_epi32_mask(nm03, l3, r1);
+    __mmask16 nm20 = _mm512_mask_cmpneq_epi32_mask(nm10, l, r2);
+
+    __m512i r3 = _mm512_shuffle_epi32(r, _MM_PERM_CBAD);
+    __mmask16 nm21 = _mm512_mask_cmpneq_epi32_mask(nm11, l1, r2);
+    __mmask16 nm22 = _mm512_mask_cmpneq_epi32_mask(nm12, l2, r2);
+    __mmask16 nm23 = _mm512_mask_cmpneq_epi32_mask(nm13, l3, r2);
+
+    __mmask16 nm0 = _mm512_mask_cmpneq_epi32_mask(nm20, l, r3);
+    __mmask16 nm1 = _mm512_mask_cmpneq_epi32_mask(nm21, l1, r3);
+    __mmask16 nm2 = _mm512_mask_cmpneq_epi32_mask(nm22, l2, r3);
+    __mmask16 nm3 = _mm512_mask_cmpneq_epi32_mask(nm23, l3, r3);
+
+    return ~(__mmask16) (nm0 & rol(nm1, 4) & rol(nm2, 8) & ror(nm3, 4));
+}
+
+void ComputeSetIntersection::MaxStepIntersect(const VertexID* l, ui l_count, const VertexID* r, ui r_count, VertexID* results, ui &result_count) {
+    // Optimization for very small sets
+    if (l_count < 16 && r_count < 16) {
+        intersect_serial(l, l_count, r, r_count, results, result_count);
+        return;
+    }
+
+    result_count = 0;
+    uint32_t const *const l_end = l + l_count;
+    uint32_t const *const r_end = r + r_count;
+    ui c = 0;
+    union vec_t {
+        __m512i zmm;
+        uint32_t u32[16];
+        uint8_t u8[64];
+    } l_vec, r_vec;
+
+    while (l + 16 < l_end && r + 16 < r_end) {
+        l_vec.zmm = _mm512_loadu_si512((__m512i const *) l);
+        r_vec.zmm = _mm512_loadu_si512((__m512i const *) r);
+
+        // Intersecting registers with involves a lot of shuffling and comparisons, 
+        // so we want to avoid it if the slices don't overlap at all..
+        uint32_t l_min;
+        uint32_t l_max = l_vec.u32[15];
+        uint32_t r_min = r_vec.u32[0];
+        uint32_t r_max = r_vec.u32[15];
+
+        // If the slices don't overlap, advance the appropriate pointer
+        while (l_max < r_min && l + 32 < l_end) {
+            l += 16;
+            l_vec.zmm = _mm512_loadu_si512((__m512i const *) l);
+            l_max = l_vec.u32[15];
+        }
+        l_min = l_vec.u32[0];
+        while (r_max < l_min && r + 32 < r_end) {
+            r += 16;
+            r_vec.zmm = _mm512_loadu_si512((__m512i const *) r);
+            r_max = r_vec.u32[15];
+        }
+        r_min = r_vec.u32[0];
+
+        __m512i l_max_vec = _mm512_set1_epi32(l_max);
+        __m512i r_max_vec = _mm512_set1_epi32(r_max);
+        __mmask16 l_step_mask = _mm512_cmple_epu32_mask(l_vec.zmm, r_max_vec);
+        __mmask16 r_step_mask = _mm512_cmple_epu32_mask(r_vec.zmm, l_max_vec);
+        l += 32 - _lzcnt_u32((uint32_t) l_step_mask);
+        r += 32 - _lzcnt_u32((uint32_t) r_step_mask);
+
+        // Now we are likely to have some overlap, so we can intersect the registers
+        __mmask16 matches = simd_intersect(l_vec.zmm, r_vec.zmm);
+
+        // Write matches
+        _mm512_mask_compressstoreu_epi32(results + result_count, matches, l_vec.zmm);
+        result_count += _mm_popcnt_u32(matches);
+    }
+
+    // Handle tail
+    intersect_serial(l, l_end - l, r, r_end - r, results + result_count, c);
+    result_count += c;
+}
+
+void ComputeSetIntersection::MaxStepIntersect(const VertexID* l, ui l_count, const VertexID* r, ui r_count, ui &result_count) {
+    // Optimization for very small sets
+    if (l_count < 16 && r_count < 16) {
+        intersect_serial(l, l_count, r, r_count, result_count);
+        return;
+    }
+
+    result_count = 0;
+    uint32_t const *const l_end = l + l_count;
+    uint32_t const *const r_end = r + r_count;
+    ui c = 0;
+    union vec_t {
+        __m512i zmm;
+        uint32_t u32[16];
+        uint8_t u8[64];
+    } l_vec, r_vec;
+
+    while (l + 16 < l_end && r + 16 < r_end) {
+        l_vec.zmm = _mm512_loadu_si512((__m512i const *) l);
+        r_vec.zmm = _mm512_loadu_si512((__m512i const *) r);
+
+        // Intersecting registers with involves a lot of shuffling and comparisons, 
+        // so we want to avoid it if the slices don't overlap at all..
+        uint32_t l_min;
+        uint32_t l_max = l_vec.u32[15];
+        uint32_t r_min = r_vec.u32[0];
+        uint32_t r_max = r_vec.u32[15];
+
+        // If the slices don't overlap, advance the appropriate pointer
+        while (l_max < r_min && l + 32 < l_end) {
+            l += 16;
+            l_vec.zmm = _mm512_loadu_si512((__m512i const *) l);
+            l_max = l_vec.u32[15];
+        }
+        l_min = l_vec.u32[0];
+        while (r_max < l_min && r + 32 < r_end) {
+            r += 16;
+            r_vec.zmm = _mm512_loadu_si512((__m512i const *) r);
+            r_max = r_vec.u32[15];
+        }
+        r_min = r_vec.u32[0];
+
+        __m512i l_max_vec = _mm512_set1_epi32(l_max);
+        __m512i r_max_vec = _mm512_set1_epi32(r_max);
+        __mmask16 l_step_mask = _mm512_cmple_epu32_mask(l_vec.zmm, r_max_vec);
+        __mmask16 r_step_mask = _mm512_cmple_epu32_mask(r_vec.zmm, l_max_vec);
+        l += 32 - _lzcnt_u32((uint32_t) l_step_mask);
+        r += 32 - _lzcnt_u32((uint32_t) r_step_mask);
+
+        __mmask16 matches = simd_intersect(l_vec.zmm, r_vec.zmm);
+
+        result_count += _mm_popcnt_u32(matches);
+    }
+
+    // Handle tail
+    intersect_serial(l, l_end - l, r, r_end - r, c);
+    result_count += c;
+}
+
 #endif

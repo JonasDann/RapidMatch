@@ -27,7 +27,7 @@
  * Accelerate set intersection with SIMD instructions.
  * 0: AVX2; 1: AVX512; 2: Basic;
  */
-#define SI 0
+#define SI 3
 
 /**
  * Optimize relation structure.
